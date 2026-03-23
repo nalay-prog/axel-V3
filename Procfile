@@ -1,1 +1,1 @@
-web: uvicorn backend.app:app --host 0.0.0.0 --port $PORT
+web: python -m flask --app backend.routes.api run --host 0.0.0.0 --port $PORT
