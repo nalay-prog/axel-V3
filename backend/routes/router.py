@@ -3,7 +3,6 @@ from typing import Dict, Any, Optional, List
 
 from ..darwin.finalizer import orchestrate, orchestrate_v2
 from ..core.orchestrator_v3 import orchestrate_v3
-from ..core.critical_claude_enforcement import enforce_claude_call
 
 
 def ask_router(
