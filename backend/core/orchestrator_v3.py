@@ -37,16 +37,6 @@ def _is_placeholder_key(value: Optional[str]) -> bool:
     return token.startswith("your_") or token.startswith("sk-...")
 
 
-def _history_tail(history: Optional[List[dict]], max_items: int = 3) -> str:
-    rows: List[str] = []
-    for msg in (history or [])[-max_items:]:
-        role = _clean(msg.get("role")).upper() or "USER"
-        content = _clean(msg.get("content"))
-        if content:
-            rows.append(f"{role}: {content}")
-    return "\n".join(rows)
-
-
 def _retrieve_vector(question: str, history: Optional[List[dict]], k: int = 4) -> Dict[str, Any]:
     retrieval = retrieve_core_raw(question=question, history=history, k=k)
     return {
