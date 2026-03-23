@@ -3,6 +3,7 @@ from typing import Dict, Any, Optional, List
 
 from ..darwin.finalizer import orchestrate, orchestrate_v2
 from ..core.orchestrator_v3 import orchestrate_v3
+from ..core.critical_claude_enforcement import enforce_claude_call
 
 
 def ask_router(
@@ -19,6 +20,7 @@ def ask_router(
     """
     Point d'entrée routeur:
     délègue la décision et l'orchestration au Darwin Finalizer.
+    🔴 AVEC ENFORCEMENT CRITIQUE DE CLAUDE
     """
     requested_version = str(darwin_version or "").strip().lower()
     if requested_version == "v3":
@@ -28,13 +30,21 @@ def ask_router(
     else:
         runner = orchestrate
 
-    return runner(
+    # 🔴 ENFORCEMENT: Force Claude à synthétiser et valide la réponse
+    def _runner_wrapper(q: str, h: Optional[List[dict]]) -> Dict[str, Any]:
+        return runner(
+            question=q,
+            history=h or [],
+            force_agent=force_agent,
+            neutral_pure=neutral_pure,
+            audit_detail=audit_detail,
+            portfolio_simulation_input=portfolio_simulation,
+            scoring_version=scoring_version,
+            session_state=session_state or {},
+        )
+
+    return enforce_claude_call(
+        _runner_wrapper,
         question=question,
-        history=history or [],
-        force_agent=force_agent,
-        neutral_pure=neutral_pure,
-        audit_detail=audit_detail,
-        portfolio_simulation_input=portfolio_simulation,
-        scoring_version=scoring_version,
-        session_state=session_state or {},
+        history=history or []
     )
