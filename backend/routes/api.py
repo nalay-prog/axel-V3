@@ -373,4 +373,5 @@ if __name__ == "__main__":
     print("=" * 60 + "\n")
 
     # ✅ IMPORTANT: désactive le reloader pour éviter de garder un état/imports incohérents
-    app.run(host="0.0.0.0", port=5050, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5050")), debug=False, use_reloader=False)
+    
