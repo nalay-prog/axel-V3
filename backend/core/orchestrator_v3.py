@@ -19,6 +19,15 @@ Objectifs clés:
 - WEB uniquement si signaux de fraîcheur / actualité.
 - Chargement .env robuste: override=True (évite clés exportées obsolètes).
 - Meta explicites: route_mode, route_signals, anthropic_key_tail, etc.
+
+Règle produit validée (b):
+✅ STRATEGIE = NO WEB par défaut (sauf signaux explicites: actuel/2026/source/lien/BCE/URL…)
+
+Ajout (confirmation web si Darwin vide):
+- Si route_mode initial = RAG, evidence_pack vide, question non-stratégie, non-darwin-specific => demander confirmation:
+  "aucune infos a ce suejt dans ma docuemtation je fais une recherche plus approfondie ?"
+  puis "Réponds OUI ou NON."
+- Si user répond OUI/NON ensuite, on utilise session_state pour relancer sans répéter la question.
 """
 
 from __future__ import annotations
@@ -54,13 +63,11 @@ from .prompt_builder import build_prompt
 from .simple_intent import detect_intent
 from .source_router import choose_sources
 
-# Fallback déterministe (si Claude down)
 try:
     from .synthesis_agent import synthesize_answer
 except Exception:  # pragma: no cover
     synthesize_answer = None  # type: ignore
 
-# Patch Claude robuste (retry modèles + fallbacks)
 try:
     from .claude_fallback_patch import _call_claude_patched
 except Exception:  # pragma: no cover
@@ -71,10 +78,6 @@ except Exception:  # pragma: no cover
 # ENV loading (robuste)
 # --------------------------------------------------------------------------------------
 def _boot_load_env() -> Dict[str, Any]:
-    """
-    Charge .env avec override=True pour éviter que des variables exportées (anciennes clés)
-    écrasent la config du projet.
-    """
     meta: Dict[str, Any] = {"dotenv_loaded": False, "dotenv_path": None}
     if load_dotenv is None:
         meta["dotenv_loaded"] = False
@@ -158,6 +161,14 @@ _WEB_SIGNAL_TERMS = (
     "acpr",
 )
 
+# Confirmation Web (garder la phrase EXACTE)
+_CONFIRM_WEB_PHRASE = "aucune infos a ce suejt dans ma docuemtation je fais une recherche plus approfondie ?"
+_CONFIRM_WEB_SUFFIX = "Réponds OUI ou NON."
+
+# Session-state keys
+_SS_WEB_CONFIRM_PENDING = "web_confirm_pending"
+_SS_WEB_CONFIRM_QUESTION = "web_confirm_question"
+
 
 def _normalize_ascii(text: str) -> str:
     t = (text or "").lower().strip()
@@ -179,9 +190,6 @@ def _is_smalltalk(question: str) -> bool:
 
 
 def _has_web_signal(question: str, intent: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """
-    Détermine si la question nécessite du web (fraîcheur/actualité).
-    """
     q = _normalize_ascii(question)
     signals: List[str] = []
 
@@ -209,9 +217,6 @@ def _has_web_signal(question: str, intent: Dict[str, Any]) -> Tuple[bool, List[s
 
 
 def _route_mode_from_sources(sources: List[str]) -> str:
-    """
-    route_mode: DIRECT | RAG | WEB | RAG+WEB
-    """
     src = list(dict.fromkeys([s for s in sources if s]))
     if not src:
         return "DIRECT"
@@ -231,11 +236,6 @@ def _apply_router_overrides(
     force_agent: Optional[str],
     neutral_mode: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Corrige les faiblesses de choose_sources() sans casser les autres règles.
-    - Smalltalk -> DIRECT (pas de web)
-    - INFO -> pas de web par défaut; web seulement si web_signal
-    """
     debug: Dict[str, Any] = {"overrides": []}
     sources = list(source_plan.get("sources") or [])
     sources = [str(s) for s in sources if str(s).strip()]
@@ -264,6 +264,12 @@ def _apply_router_overrides(
 
     final_sources = list(dict.fromkeys(sources))
 
+    # ✅ RÈGLE B VALIDÉE: STRATEGIE = NO WEB par défaut (sauf signaux explicites)
+    if intent_type == "STRATEGIE" and not has_web_signal:
+        if "web" in final_sources:
+            final_sources = [s for s in final_sources if s != "web"]
+            debug["overrides"].append("strategie_no_web_by_default")
+
     if intent_type in {"INFO", "DARWIN"} and not has_web_signal:
         if "web" in final_sources:
             final_sources = [s for s in final_sources if s != "web"]
@@ -285,7 +291,50 @@ def _apply_router_overrides(
     reasoning = list(source_plan.get("reasoning") or [])
     reasoning.extend([f"override:{x}" for x in debug.get("overrides") or []])
 
-    return ({"sources": final_sources, "primary_source": final_sources[0] if final_sources else None, "reasoning": reasoning}, debug)
+    return (
+        {
+            "sources": final_sources,
+            "primary_source": final_sources[0] if final_sources else None,
+            "reasoning": reasoning,
+        },
+        debug,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Yes/No confirmation helpers
+# --------------------------------------------------------------------------------------
+def _classify_yes_no(text: str) -> str:
+    """
+    Returns: "yes" | "no" | ""
+    """
+    t = _normalize_ascii(text)
+    if not t:
+        return ""
+    # Keep it strict enough to avoid accidental triggers
+    yes_tokens = ("oui", "ouais", "ok", "okay", "vas y", "vas-y", "go", "daccord", "d'accord", "parfait")
+    no_tokens = ("non", "no", "stop", "annule", "annuler", "pas maintenant")
+    if any(re.fullmatch(rf".*\b{re.escape(tok)}\b.*", t) for tok in yes_tokens):
+        return "yes"
+    if any(re.fullmatch(rf".*\b{re.escape(tok)}\b.*", t) for tok in no_tokens):
+        return "no"
+    return ""
+
+
+def _make_session_state_patch_for_web_confirm(pending: bool, question: str = "") -> Dict[str, Any]:
+    if not pending:
+        return {
+            _SS_WEB_CONFIRM_PENDING: None,
+            _SS_WEB_CONFIRM_QUESTION: None,
+        }
+    return {
+        _SS_WEB_CONFIRM_PENDING: True,
+        _SS_WEB_CONFIRM_QUESTION: question,
+    }
+
+
+def _confirm_web_message() -> str:
+    return f"{_CONFIRM_WEB_PHRASE}\n\n{_CONFIRM_WEB_SUFFIX}"
 
 
 # --------------------------------------------------------------------------------------
@@ -294,7 +343,6 @@ def _apply_router_overrides(
 def _direct_answer(question: str, history: List[dict]) -> str:
     q = _normalize_ascii(question)
 
-    # Smalltalk / trivial
     if _is_smalltalk(question):
         return (
             "Bonjour 👋\n\n"
@@ -302,7 +350,6 @@ def _direct_answer(question: str, history: List[dict]) -> str:
             "et je te réponds en format CGP."
         )
 
-    # Very short / vague
     if len(q) < 12 or len(q.split()) <= 2:
         return (
             "Je peux t’aider, mais il me manque le contexte.\n\n"
@@ -313,7 +360,6 @@ def _direct_answer(question: str, history: List[dict]) -> str:
             "- fiscalité (IR/IS) + TMI si IR\n"
         )
 
-    # Default direct (still without Claude)
     return (
         "Reçu. Pour te répondre au mieux, précise si tu veux :\n"
         "- une réponse courte (KPI)\n"
@@ -395,7 +441,11 @@ def _call_claude_local(system_prompt: str, user_prompt: str) -> Tuple[str, Dict[
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         }
-        headers = {"x-api-key": str(api_key), "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        headers = {
+            "x-api-key": str(api_key),
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
 
         if httpx is not None:
             response = httpx.post(
@@ -416,7 +466,7 @@ def _call_claude_local(system_prompt: str, user_prompt: str) -> Tuple[str, Dict[
             with urlopen(request, timeout=float(os.getenv("CLAUDE_OPTIMIZED_TIMEOUT_SECONDS", "20"))) as res:
                 data = json.loads(res.read().decode("utf-8", errors="replace"))
 
-        parts = []
+        parts: List[str] = []
         for block in (data.get("content") or []):
             if isinstance(block, dict) and _clean(block.get("text")):
                 parts.append(_clean(block.get("text")))
@@ -453,11 +503,90 @@ def orchestrate_v3(
     session_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
-    _ = audit_detail, portfolio_simulation_input, scoring_version, session_state
+    _ = audit_detail, portfolio_simulation_input, scoring_version
 
     history = history or []
     question = _clean(question)
     neutral_mode = bool(neutral_pure)
+    session_state = session_state or {}
+
+    # ----------------------------------------------------------------------------------
+    # 0) Confirmation WEB (sans répéter la question)
+    # ----------------------------------------------------------------------------------
+    session_state_patch: Dict[str, Any] = {}
+    if bool(session_state.get(_SS_WEB_CONFIRM_PENDING)) and isinstance(session_state.get(_SS_WEB_CONFIRM_QUESTION), str):
+        original_question = str(session_state.get(_SS_WEB_CONFIRM_QUESTION) or "").strip()
+        decision = _classify_yes_no(question)
+        if decision == "yes":
+            # Force web on original question, clear pending
+            question = original_question
+            force_agent = force_agent or "web"
+            session_state_patch = _make_session_state_patch_for_web_confirm(False)
+        elif decision == "no":
+            # Clear pending, keep in Darwin mode
+            session_state_patch = _make_session_state_patch_for_web_confirm(False)
+            ack = "OK."
+            empty_evidence = {"items": [], "sources": [], "sources_by_layer": {}, "raw_count": 0}
+            validated = validate_output(answer=ack, question=question, intent={"type": "INFO"}, evidence_pack=empty_evidence)
+            final_answer = validated["answer"]
+            structured_v2 = build_structured_payload(
+                answer=final_answer,
+                intent={"type": "INFO"},
+                evidence_pack=empty_evidence,
+                status=str(validated.get("status") or "ok"),
+            )
+            total_time = time.time() - start_time
+            meta = {
+                "darwin_version": "v3",
+                "simple_mode": True,
+                "route_mode": "DIRECT",
+                "route_signals": {"smalltalk": False, "web_signals": [], "router_overrides": ["web_confirm_cancelled"]},
+                "intent": "INFO",
+                "intent_raw": "INFO",
+                "intent_final": "INFO",
+                "intent_cgp": structured_v2.get("intent"),
+                "kpi_target": structured_v2.get("kpi_target"),
+                "agents_called": [],
+                "agent_outputs_count": 0,
+                "selected_agent": None,
+                "selected_layer": None,
+                "neutral_pure": neutral_mode,
+                "live_web_signal": False,
+                "response_format": "structured_contract_v3",
+                "contract_format_enforced": True,
+                "contract_rewrite_engine": "direct_deterministic",
+                "finalizer_llm_provider_requested": "anthropic",
+                "finalizer_llm_provider_effective": "none_direct",
+                "finalizer_llm_model": None,
+                "llm_warning": None,
+                "anthropic_key_tail": _anthropic_key_tail(),
+                "env_boot": ENV_BOOT_META,
+                "source_plan": {"sources": [], "primary_source": None, "reasoning": ["web_confirm_cancelled"]},
+                "retrieval_meta": {},
+                "evidence_items_count": 0,
+                "evidence_raw_count": 0,
+                "followup_flow_active": False,
+                "followup_phase": "idle",
+                "effective_query_used": question,
+                "session_state_patch": session_state_patch,
+                "response_time_seconds": round(total_time, 2),
+            }
+            return {
+                "answer": final_answer,
+                "answer_text": final_answer,
+                "answer_json": {"format": "simple_v3", "intent": structured_v2.get("intent"), "answer": final_answer, "sources": []},
+                "answer_structured": {"format": "simple_v3", "intent": structured_v2.get("intent"), "answer": final_answer, "sources": []},
+                "answer_structured_v2": structured_v2,
+                "answer_contract": {"intent": str(structured_v2.get("intent") or "INFO"), "kpi_target": str(structured_v2.get("kpi_target") or "none")},
+                "details": final_answer,
+                "used_facts": [],
+                "warnings": list(validated.get("warnings") or []),
+                "sources": [],
+                "sources_by_layer": {},
+                "agent_used": "darwin_v3_brain",
+                "meta": meta,
+            }
+        # If not yes/no => continue normal flow (no clear)
 
     # 1) Intent
     intent = detect_intent(question=question, history=history)
@@ -550,7 +679,7 @@ def orchestrate_v3(
             "followup_flow_active": False,
             "followup_phase": "idle",
             "effective_query_used": question,
-            "session_state_patch": {},
+            "session_state_patch": session_state_patch,
             "response_time_seconds": round(total_time, 2),
         }
 
@@ -599,6 +728,111 @@ def orchestrate_v3(
         raw_material=raw_material,
         max_items=8,
     )
+
+    # ----------------------------------------------------------------------------------
+    # 4.b) Confirmation WEB si Darwin vide (sans lancer Web tout seul)
+    # ----------------------------------------------------------------------------------
+    intent_type = str(intent.get("type") or "INFO").upper()
+    evidence_items = evidence_pack.get("items") if isinstance(evidence_pack.get("items"), list) else []
+    evidence_is_empty = len(evidence_items) == 0
+
+    # Gardes-fous: uniquement quand on est en RAG, pas STRATEGIE, pas déjà WEB, pas darwin-specific
+    if (
+        route_mode == "RAG"
+        and evidence_is_empty
+        and intent_type != "STRATEGIE"
+        and not bool(intent.get("is_darwin_specific"))
+        and not str(force_agent or "").strip()
+    ):
+        confirm_text = _confirm_web_message()
+        empty_evidence = {"items": [], "sources": [], "sources_by_layer": {}, "raw_count": 0}
+        validated = validate_output(answer=confirm_text, question=question, intent=intent, evidence_pack=empty_evidence)
+        final_answer = validated["answer"]
+        warnings = list(validated.get("warnings") or [])
+
+        structured_v2 = build_structured_payload(
+            answer=final_answer,
+            intent=intent,
+            evidence_pack=empty_evidence,
+            status=str(validated.get("status") or "ok"),
+        )
+
+        total_time = time.time() - start_time
+
+        # Patch session_state: on attend OUI/NON et on sauvegarde la question originale
+        session_state_patch = _make_session_state_patch_for_web_confirm(True, question)
+
+        meta = {
+            "darwin_version": "v3",
+            "simple_mode": True,
+            "route_mode": "RAG",
+            "route_signals": {
+                "smalltalk": False,
+                "web_signals": router_debug.get("web_signals") if isinstance(router_debug, dict) else [],
+                "router_overrides": (router_debug.get("overrides") if isinstance(router_debug, dict) else []) + ["web_confirm_requested"],
+            },
+            "intent": intent.get("type"),
+            "intent_raw": intent.get("type"),
+            "intent_final": intent.get("type"),
+            "intent_cgp": structured_v2.get("intent"),
+            "kpi_target": structured_v2.get("kpi_target"),
+            "agents_called": agents_called,
+            "agent_outputs_count": len(raw_material),
+            "selected_agent": source_plan.get("primary_source"),
+            "selected_layer": source_plan.get("primary_source"),
+            "neutral_pure": neutral_mode,
+            "live_web_signal": False,
+            "strict_realtime_required": False,
+            "strict_realtime_blocked": False,
+            "clarification_requested": True,
+            "clarification_reason": "web_confirmation_required",
+            "clarification_missing_fields": ["OUI/NON"],
+            "response_format": "structured_contract_v3",
+            "contract_format_enforced": True,
+            "contract_rewrite_engine": "direct_deterministic",
+            "finalizer_llm_provider_requested": "anthropic",
+            "finalizer_llm_provider_effective": "none_confirm",
+            "finalizer_llm_model": None,
+            "llm_warning": None,
+            "anthropic_key_tail": _anthropic_key_tail(),
+            "env_boot": ENV_BOOT_META,
+            "source_plan": source_plan,
+            "retrieval_meta": retrieval_meta,
+            "evidence_items_count": 0,
+            "evidence_raw_count": int(evidence_pack.get("raw_count") or 0),
+            "followup_flow_active": True,
+            "followup_phase": "confirm_web",
+            "effective_query_used": question,
+            "session_state_patch": session_state_patch,
+            "response_time_seconds": round(total_time, 2),
+        }
+
+        answer_json = {
+            "format": "simple_v3",
+            "intent": structured_v2.get("intent"),
+            "answer": final_answer,
+            "sources": [],
+        }
+
+        return {
+            "answer": final_answer,
+            "answer_text": final_answer,
+            "answer_json": answer_json,
+            "answer_structured": answer_json,
+            "answer_structured_v2": structured_v2,
+            "answer_contract": {
+                "intent": str(structured_v2.get("intent") or intent.get("type") or "INFO"),
+                "kpi_target": str(structured_v2.get("kpi_target") or intent.get("kpi_target") or "none"),
+            },
+            "details": final_answer,
+            "used_facts": [],
+            "warnings": warnings,
+            "sources": [],
+            "sources_by_layer": {},
+            "agent_used": "darwin_v3_brain",
+            "meta": meta,
+        }
+
     prompts = build_prompt(
         question=question,
         history=history,
@@ -692,7 +926,7 @@ def orchestrate_v3(
         "followup_flow_active": False,
         "followup_phase": "idle",
         "effective_query_used": question,
-        "session_state_patch": {},
+        "session_state_patch": session_state_patch,
         "response_time_seconds": round(total_time, 2),
     }
 
@@ -707,7 +941,11 @@ def orchestrate_v3(
             "kpi_target": str(structured_v2.get("kpi_target") or intent.get("kpi_target") or "none"),
         },
         "details": final_answer if not deterministic_payload else str(deterministic_payload.get("details") or final_answer),
-        "used_facts": [item.get("snippet") for item in (evidence_pack.get("items") or [])[:5] if _clean(item.get("snippet"))],
+        "used_facts": [
+            item.get("snippet")
+            for item in (evidence_pack.get("items") or [])[:5]
+            if _clean(item.get("snippet"))
+        ],
         "warnings": warnings,
         "sources": evidence_pack.get("sources") or [],
         "sources_by_layer": evidence_pack.get("sources_by_layer") or {},
@@ -718,16 +956,24 @@ def orchestrate_v3(
 
 if __name__ == "__main__":
     tests = [
-        "hello",
-        "Quels sont les frais de Darwin RE01 ?",
-        "taux BCE actuel 2026 ?",
-        "frais Darwin RE01 + taux BCE actuel 2026",
+        "donne le pga de la scpi wemo",
+        "oui",
+        "non",
     ]
+    ss = {}
     for q in tests:
-        res = orchestrate_v3(question=q, history=[])
+        res = orchestrate_v3(question=q, history=[], session_state=ss)
+        ss_patch = (res.get("meta") or {}).get("session_state_patch") or {}
+        # emulate api.py merge behavior
+        if isinstance(ss_patch, dict):
+            for k, v in ss_patch.items():
+                if v is None:
+                    ss.pop(k, None)
+                else:
+                    ss[k] = v
         print("\n====================")
         print("Q:", q)
         print("route_mode:", res.get("meta", {}).get("route_mode"))
-        print("agents_called:", res.get("meta", {}).get("agents_called"))
-        print("finalizer_effective:", res.get("meta", {}).get("finalizer_llm_provider_effective"))
-        print("answer:", (res.get("answer") or "")[:200])
+        print("followup_phase:", res.get("meta", {}).get("followup_phase"))
+        print("session_state:", ss)
+        print("answer:", (res.get("answer") or "")[:220])
