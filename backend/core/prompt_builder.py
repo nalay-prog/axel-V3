@@ -1,3 +1,4 @@
+# backend/core/prompt_builder.py
 from typing import Any, Dict, List, Optional
 
 
@@ -26,7 +27,19 @@ def _format_instruction(intent_type: str) -> str:
             "Chaque chiffre cité doit mentionner sa source."
         ),
         "STRATEGIE": (
-            "Réponds avec: Analyse, Recommandation, Risques, puis Prochaines étapes."
+            "FORMAT STRATEGIE_CGP OBLIGATOIRE:\n"
+            "1) Décision (1–2 lignes)\n"
+            "2) Allocation proposée (TABLEAU OBLIGATOIRE)\n"
+            "   Colonnes: Poche | % cible (fourchette) | Enveloppe | Objectif | Contraintes (liquidité/horizon)\n"
+            "   Règles:\n"
+            "   - Toujours une fourchette en % (ex: 10–20), jamais une valeur seule.\n"
+            "   - Total cohérent ≈ 100%.\n"
+            "   - Si info manquante: propose une allocation prudente par défaut + section 'Hypothèses'.\n"
+            "3) Justification (3–6 bullets)\n"
+            "4) Arbitrages (IR/IS, enveloppe, liquidité)\n"
+            "5) Risques & garde-fous (3–5 bullets)\n"
+            "6) Plan d’action CGP (3 étapes)\n"
+            "7) Questions à préciser (max 2, seulement si nécessaire)\n"
         ),
         "RAPPORT": (
             "Réponds comme une note client courte: synthèse, points clés, vigilance, prochaine action."
@@ -45,6 +58,7 @@ def build_prompt(
     evidence_pack: Dict[str, Any],
 ) -> Dict[str, str]:
     intent_type = _clean(intent.get("type")).upper() or "INFO"
+
     evidence_lines: List[str] = []
     for index, item in enumerate(evidence_pack.get("items") or [], start=1):
         title = _clean(item.get("title"))
@@ -65,16 +79,36 @@ def build_prompt(
         f"- {item}" for item in (intent.get("clarification_questions") or [])
     ) or "- Aucune"
 
-    system_prompt = (
+    # System prompt: on durcit STRATEGIE pour être "CGP senior" et éviter l'hallucination.
+    # Différence clé vs INFO/KPI:
+    # - En STRATEGIE, on autorise des allocations par défaut prudentes (hypothèses explicites),
+    #   MAIS on interdit d'inventer des chiffres factuels non sourcés (taux, performances, dates exactes).
+    base_system_prompt = (
         "Tu es Claude, cerveau unique du pipeline Darwin.\n"
         "Tu rédiges la réponse finale en français à partir des preuves fournies.\n"
         "Règles:\n"
-        "- Utilise uniquement le pack de preuves ci-dessous.\n"
+        "- Utilise en priorité le pack de preuves ci-dessous.\n"
         "- N'invente jamais de chiffres, dates, classements ou sources.\n"
-        "- Si une preuve manque, dis-le clairement et demande au plus 2 précisions utiles.\n"
-        "- Si tu cites un chiffre, mentionne la source ou le domaine.\n"
+        "- Si tu cites un chiffre factuel (taux, performance, date, KPI), mentionne la source/le domaine.\n"
         "- Réponse directe, utile, sans méta-commentaire.\n"
     )
+
+    strategie_addendum = (
+        "Mode STRATEGIE_CGP:\n"
+        "- Tu dois produire une recommandation exploitable par un CGP.\n"
+        "- TABLEAU D’ALLOCATION OBLIGATOIRE (fourchettes %).\n"
+        "- Si des infos manquent (horizon, fiscalité, profil risque), tu proposes une allocation prudente "
+        "par défaut avec une section 'Hypothèses', puis tu poses au maximum 2 questions.\n"
+        "- Ne bloque jamais la réponse.\n"
+    )
+
+    if intent_type == "STRATEGIE":
+        system_prompt = base_system_prompt + strategie_addendum
+    else:
+        system_prompt = (
+            base_system_prompt
+            + "- Si une preuve manque, dis-le clairement et demande au plus 2 précisions utiles.\n"
+        )
 
     user_prompt = (
         f"QUESTION:\n{_clean(question)}\n\n"

@@ -6,12 +6,13 @@ Point d'entrée principal pour toutes les requêtes du frontend
 
 import sys
 import os
+import traceback
+import inspect
 from typing import List, Dict, Optional
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION DU PATH
 # ════════════════════════════════════════════════════════════════════════════
-# Permet d'importer le package `backend` depuis n'importe où
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -33,13 +34,25 @@ from backend.memory.memory_store import (
     clear_session_state,
 )
 
+# ✅ DEBUG BOOT: prouve quel module est réellement importé par Flask
+try:
+    from backend.core.source_router import choose_sources, route_sources
+
+    print("[BOOT] python =", sys.executable)
+    print("[BOOT] cwd    =", os.getcwd())
+    print("[BOOT] source_router file =", inspect.getsourcefile(choose_sources))
+    print("[BOOT] choose_sources is route_sources =", choose_sources is route_sources)
+    print("[BOOT] choose_sources signature =", inspect.signature(choose_sources))
+    print("[BOOT] route_sources signature  =", inspect.signature(route_sources))
+except Exception:
+    print("[BOOT] unable to introspect source_router")
+    print(traceback.format_exc())
+
 # ════════════════════════════════════════════════════════════════════════════
 # INITIALISATION DE L'APPLICATION
 # ════════════════════════════════════════════════════════════════════════════
-# Désactive le routeur static natif Flask (/static/*),
-# sinon il capte les assets React build et renvoie 404.
 app = Flask(__name__, static_folder=None)
-CORS(app)  # Active les requêtes cross-origin (frontend → backend)
+CORS(app)
 
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "20"))
 MAX_REPLAY_LOGS_PER_SESSION = int(os.getenv("MAX_REPLAY_LOGS_PER_SESSION", "500"))
@@ -134,77 +147,35 @@ def _merge_session_state(current: Dict[str, object], patch: Dict[str, object]) -
         out[key] = value
     return out
 
-# ════════════════════════════════════════════════════════════════════════════
-# ENDPOINT PRINCIPAL : /ask
-# ════════════════════════════════════════════════════════════════════════════
+
 @app.route("/ask", methods=["POST"])
 def ask():
-    """
-    Endpoint pour poser une question à l'agent Darwin
-    
-    📥 ENTRÉE (JSON) :
-        {
-            "question": "Ma question ici",        # 🔴 OBLIGATOIRE
-            "force_agent": "web"|"core"|"rapport",# ⚪ OPTIONNEL (force un agent spécifique)
-            "history": [{...}],                   # ⚪ OPTIONNEL (historique conversationnel)
-            "session_id": "user123"               # ⚪ OPTIONNEL (pour la mémoire conversationnelle)
-        }
-    
-    📤 SORTIE (JSON) :
-        {
-            "result": "{ ...json formaté... }",
-            "result_structured": {
-                "analyse": "...",
-                "strategie": "...",
-                "projection": "...",
-                "arbitrages": "...",
-                "risques": "...",
-                "conclusion": "..."
-            },
-            "sources": ["doc1.pdf", "web"],
-            "agent_used": "core",
-            "session_id": "user123"
-        }
-    """
-    
-    # ──────────────────────────────────────────────────────────────────────
-    # 1️⃣ RÉCUPÉRATION DES DONNÉES
-    # ──────────────────────────────────────────────────────────────────────
-    data = request.get_json(silent=True) or {}  # Si pas de JSON, utilise {}
-    
-    question = data.get("question", "").strip()  # Récupère la question (obligatoire)
-    force_agent = data.get("force_agent")        # "web" ou "core" (optionnel)
+    data = request.get_json(silent=True) or {}
+
+    question = str(data.get("question", "") or "").strip()
+    force_agent = data.get("force_agent")
     scoring_version = str(data.get("scoring_version", "")).strip() or None
     darwin_version_raw = str(data.get("darwin_version", DARWIN_DEFAULT_VERSION)).strip().lower()
-    darwin_version = (
-        darwin_version_raw
-        if darwin_version_raw in SUPPORTED_DARWIN_VERSIONS
-        else DARWIN_DEFAULT_VERSION
-    )
+    darwin_version = darwin_version_raw if darwin_version_raw in SUPPORTED_DARWIN_VERSIONS else DARWIN_DEFAULT_VERSION
+
     neutral_pure = _as_bool(data.get("neutral_pure"), default=False)
     audit_detail = _as_bool(data.get("audit_detail"), default=False)
     portfolio_simulation = _extract_portfolio_simulation(data)
-    session_id = data.get("session_id", "default")  # ID de session (pour mémoire)
+    session_id = str(data.get("session_id", "default") or "default")
+
     incoming_history = _normalize_history(data.get("history") or [])
     persisted_history = get_history(session_id, max_messages=MAX_MEMORY_MESSAGES)
     history = _merge_history(persisted_history, incoming_history, MAX_MEMORY_MESSAGES)
     session_state = get_session_state(session_id)
-    
-    # ──────────────────────────────────────────────────────────────────────
-    # 2️⃣ VALIDATION
-    # ──────────────────────────────────────────────────────────────────────
+
     if not question:
         return jsonify({"error": "❌ Question manquante ou vide"}), 400
-    
-    # ──────────────────────────────────────────────────────────────────────
-    # 3️⃣ APPEL DU ROUTEUR (cerveau du système multi-agent)
-    # ──────────────────────────────────────────────────────────────────────
+
     try:
-        # Le routeur décide quel agent utiliser (ou utilise force_agent si spécifié)
         response = ask_router(
             question=question,
             history=history,
-            force_agent=force_agent,  # Si None, le routeur décide automatiquement
+            force_agent=force_agent,
             neutral_pure=neutral_pure,
             audit_detail=audit_detail,
             portfolio_simulation=portfolio_simulation,
@@ -223,6 +194,7 @@ def ask():
                 merged_state = _merge_session_state(session_state, session_state_patch)
                 set_session_state(session_id, merged_state)
                 session_state = merged_state
+
         replay_id = None
         replay_created_at = None
         replay_log_error = None
@@ -244,7 +216,6 @@ def ask():
             replay_log_error = str(replay_exc)
             print(f"⚠️ Replay log error: {replay_log_error}")
 
-        # Persistance automatique du tour courant (user -> assistant)
         append_turn(
             session_id=session_id,
             user_content=question,
@@ -258,6 +229,7 @@ def ask():
         structured_answer_v2 = response.get("answer_structured_v2")
         if not isinstance(structured_answer_v2, dict):
             structured_answer_v2 = None
+
         result_contract = response.get("answer_contract")
         if not isinstance(result_contract, dict):
             result_contract = {}
@@ -265,23 +237,21 @@ def ask():
             "intent": str(result_contract.get("intent") or response_meta.get("intent_cgp") or "KPI"),
             "kpi_target": str(result_contract.get("kpi_target") or response_meta.get("kpi_target") or "none"),
         }
+
         result_text = response.get("answer_text") or response.get("answer", "")
         if not isinstance(result_text, str):
             result_text = str(result_text or "")
-        rendered_v2 = ""
+
         if isinstance(structured_answer_v2, dict):
             rendered_v2 = str(structured_answer_v2.get("rendered_text") or "").strip()
             if rendered_v2:
                 result_text = rendered_v2
 
-        response_meta["intent_cgp"] = str(
-            response_meta.get("intent_cgp") or result_contract.get("intent") or "KPI"
-        )
-        response_meta["kpi_target"] = str(
-            response_meta.get("kpi_target") or result_contract.get("kpi_target") or "none"
-        )
+        response_meta["intent_cgp"] = str(response_meta.get("intent_cgp") or result_contract.get("intent") or "KPI")
+        response_meta["kpi_target"] = str(response_meta.get("kpi_target") or result_contract.get("kpi_target") or "none")
         response_meta["contract_format_enforced"] = bool(structured_answer_v2)
         response_meta["darwin_version"] = str(response_meta.get("darwin_version") or darwin_version)
+
         def _safe_int(value, default: int = 0) -> int:
             try:
                 return int(str(value).strip())
@@ -296,82 +266,57 @@ def ask():
         if top_mode not in {"llm_raw", "resolved_from_source", "deterministic_fallback"}:
             top_mode = "deterministic_fallback"
         response_meta["top_name_resolution_mode"] = top_mode
-        
-        # ──────────────────────────────────────────────────────────────────
-        # 4️⃣ CONSTRUCTION DE LA RÉPONSE
-        # ──────────────────────────────────────────────────────────────────
-        return jsonify({
-            "result": result_text,  # Compat frontend: toujours une string
-            "result_structured": structured_answer if isinstance(structured_answer, dict) else None,
-            "result_structured_v2": structured_answer_v2,
-            "result_contract": result_contract,
-            "result_text": result_text,
-            "sources": response.get("sources", []),     # Documents/sites utilisés
-            "sources_by_layer": response.get("sources_by_layer", {}),
-            "agent_used": response.get("agent_used"),   # Quel agent a répondu (core/web)
-            "replay_id": replay_id,
-            "replay": {
-                "id": replay_id,
-                "created_at": replay_created_at,
-            },
-            "meta": {
-                **response_meta,
-                "followup_flow_active": bool(response_meta.get("followup_flow_active")),
-                "followup_phase": response_meta.get("followup_phase"),
-                "effective_query_used": response_meta.get("effective_query_used"),
-                "request_flags": {
-                    "darwin_version": darwin_version,
-                    "neutral_pure": neutral_pure,
-                    "audit_detail": audit_detail,
-                    "portfolio_simulation": bool(portfolio_simulation),
-                    "scoring_version": scoring_version,
-                },
-                "memory": {
-                    "session_id": session_id,
-                    "history_messages_used": len(history),
-                    "max_memory_messages": MAX_MEMORY_MESSAGES,
-                    "session_state": session_state,
-                },
-                "replay": {
-                    "id": replay_id,
-                    "created_at": replay_created_at,
-                    "error": replay_log_error,
-                },
-            },                                          # Détails orchestration + mémoire
-            "session_id": session_id                    # ID de session renvoyé
-        })
-    
-    except Exception as e:
-        # En cas d'erreur (agent planté, problème réseau, etc.)
-        print(f"❌ ERREUR: {str(e)}")  # Log dans le terminal
-        return jsonify({
-            "error": f"Erreur serveur: {str(e)}"
-        }), 500
 
-# ════════════════════════════════════════════════════════════════════════════
-# ENDPOINT DE TEST : /test
-# ════════════════════════════════════════════════════════════════════════════
+        return jsonify(
+            {
+                "result": result_text,
+                "result_structured": structured_answer if isinstance(structured_answer, dict) else None,
+                "result_structured_v2": structured_answer_v2,
+                "result_contract": result_contract,
+                "result_text": result_text,
+                "sources": response.get("sources", []),
+                "sources_by_layer": response.get("sources_by_layer", {}),
+                "agent_used": response.get("agent_used"),
+                "replay_id": replay_id,
+                "replay": {"id": replay_id, "created_at": replay_created_at},
+                "meta": {
+                    **response_meta,
+                    "followup_flow_active": bool(response_meta.get("followup_flow_active")),
+                    "followup_phase": response_meta.get("followup_phase"),
+                    "effective_query_used": response_meta.get("effective_query_used"),
+                    "request_flags": {
+                        "darwin_version": darwin_version,
+                        "neutral_pure": neutral_pure,
+                        "audit_detail": audit_detail,
+                        "portfolio_simulation": bool(portfolio_simulation),
+                        "scoring_version": scoring_version,
+                    },
+                    "memory": {
+                        "session_id": session_id,
+                        "history_messages_used": len(history),
+                        "max_memory_messages": MAX_MEMORY_MESSAGES,
+                        "session_state": session_state,
+                    },
+                    "replay": {"id": replay_id, "created_at": replay_created_at, "error": replay_log_error},
+                },
+                "session_id": session_id,
+            }
+        )
+
+    except Exception as e:
+        # ✅ Log complet du traceback (au lieu de seulement str(e))
+        print("❌ ERREUR /ask:", str(e))
+        print(traceback.format_exc())
+        return jsonify({"error": f"Erreur serveur: {str(e)}"}), 500
+
+
 @app.route("/test", methods=["GET"])
 def test():
-    """
-    Endpoint simple pour vérifier que l'API est en ligne
-    
-    📥 ENTRÉE : Aucune
-    📤 SORTIE : {"message": "...", "status": "ok"}
-    
-    🧪 TEST : curl http://localhost:5050/test
-    """
-    return jsonify({
-        "message": "✅ API Darwin Agent en ligne",
-        "status": "ok"
-    })
+    return jsonify({"message": "✅ API Darwin Agent en ligne", "status": "ok"})
 
 
 @app.route("/replay/<replay_id>", methods=["GET"])
 def replay_get(replay_id: str):
-    """
-    Récupère un log complet par replay_id.
-    """
     safe_replay_id = (replay_id or "").strip()
     if not safe_replay_id:
         return jsonify({"error": "❌ replay_id manquant"}), 400
@@ -379,17 +324,11 @@ def replay_get(replay_id: str):
     item = get_ask_log(safe_replay_id)
     if not item:
         return jsonify({"error": "❌ replay introuvable", "replay_id": safe_replay_id}), 404
-    return jsonify({
-        "replay": item,
-        "status": "ok",
-    })
+    return jsonify({"replay": item, "status": "ok"})
 
 
 @app.route("/replay", methods=["GET"])
 def replay_list():
-    """
-    Liste les derniers logs d'une session pour replay.
-    """
     session_id = str(request.args.get("session_id", "default")).strip() or "default"
     limit_raw = request.args.get("limit", "20")
     try:
@@ -399,50 +338,39 @@ def replay_list():
     limit = max(1, min(limit, 100))
 
     items = list_ask_logs(session_id=session_id, limit=limit)
-    return jsonify({
-        "session_id": session_id,
-        "count": len(items),
-        "replays": items,
-        "status": "ok",
-    })
+    return jsonify({"session_id": session_id, "count": len(items), "replays": items, "status": "ok"})
 
-# ════════════════════════════════════════════════════════════════════════════
-# SERVING FRONTEND BUILD (OPTIONNEL)
-# ════════════════════════════════════════════════════════════════════════════
+
 @app.route("/", defaults={"path": ""}, methods=["GET"])
 @app.route("/<path:path>", methods=["GET"])
 def serve_frontend(path: str):
-    """
-    Sert le frontend React buildé si disponible.
-    Permet d'ouvrir l'UI via http://localhost:5050 même sans `npm start`.
-    """
     if not os.path.isdir(FRONTEND_BUILD_DIR):
-        return jsonify({
-            "error": "Frontend build introuvable.",
-            "hint": "Exécute `cd frontend && npm run build` puis recharge cette URL.",
-            "api_test": "GET /test",
-            "ask_endpoint": "POST /ask",
-        }), 404
+        return (
+            jsonify(
+                {
+                    "error": "Frontend build introuvable.",
+                    "hint": "Exécute `cd frontend && npm run build` puis recharge cette URL.",
+                    "api_test": "GET /test",
+                    "ask_endpoint": "POST /ask",
+                }
+            ),
+            404,
+        )
 
     requested = os.path.join(FRONTEND_BUILD_DIR, path)
     if path and os.path.exists(requested):
         return send_from_directory(FRONTEND_BUILD_DIR, path)
     return send_from_directory(FRONTEND_BUILD_DIR, "index.html")
 
-# ════════════════════════════════════════════════════════════════════════════
-# DÉMARRAGE DU SERVEUR
-# ════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("🚀 DÉMARRAGE DU SERVEUR DARWIN AGENT")
-    print("="*60)
+    print("=" * 60)
     print("📍 URL principale : http://localhost:5050")
     print("📬 Endpoint /ask  : POST http://localhost:5050/ask")
     print("🧪 Endpoint /test : GET  http://localhost:5050/test")
-    print("="*60 + "\n")
-    
-    # Lance le serveur Flask
-    # - host="0.0.0.0" : accessible depuis d'autres machines
-    # - port=5050 : le port utilisé
-    # - debug=True : recharge automatiquement si tu modifies le code
-    app.run(host="0.0.0.0", port=5050, debug=True)
+    print("=" * 60 + "\n")
+
+    # ✅ IMPORTANT: désactive le reloader pour éviter de garder un état/imports incohérents
+    app.run(host="0.0.0.0", port=5050, debug=True, use_reloader=False)
