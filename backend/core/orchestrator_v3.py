@@ -16,18 +16,13 @@ Design final validé:
 
 Objectifs clés:
 - "hello" ne déclenche jamais une recherche web.
-- WEB uniquement si signaux de fraîcheur / actualité.
+- STRATEGIE = NO WEB par défaut (sauf signaux explicites: actuel/2026/source/lien/BCE/URL…)
 - Chargement .env robuste: override=True (évite clés exportées obsolètes).
 - Meta explicites: route_mode, route_signals, anthropic_key_tail, etc.
 
-Règle produit validée (b):
-✅ STRATEGIE = NO WEB par défaut (sauf signaux explicites: actuel/2026/source/lien/BCE/URL…)
-
-Ajout (confirmation web si Darwin vide):
-- Si route_mode initial = RAG, evidence_pack vide, question non-stratégie, non-darwin-specific => demander confirmation:
-  "aucune infos a ce suejt dans ma docuemtation je fais une recherche plus approfondie ?"
-  puis "Réponds OUI ou NON."
-- Si user répond OUI/NON ensuite, on utilise session_state pour relancer sans répéter la question.
+Ajout produit (option A):
+✅ Si route_mode initial = RAG, et Darwin n'apporte PAS de preuves pertinentes -> fallback automatique WEB + Claude.
+  (Sans confirmation OUI/NON.)
 """
 
 from __future__ import annotations
@@ -109,8 +104,7 @@ def _clean(text: Any) -> str:
 
 
 def _anthropic_key_tail() -> str:
-    key = os.getenv("ANTHROPIC_API_KEY") or ""
-    key = key.strip()
+    key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
     return key[-4:] if len(key) >= 4 else ""
 
 
@@ -122,6 +116,16 @@ def _is_placeholder_key(value: Optional[str]) -> bool:
     if token in placeholders:
         return True
     return token.startswith("your_") or token.startswith("sk-...")
+
+
+def _normalize_ascii(text: str) -> str:
+    t = (text or "").lower().strip()
+    t = t.replace("é", "e").replace("è", "e").replace("ê", "e")
+    t = t.replace("à", "a").replace("â", "a").replace("î", "i")
+    t = t.replace("ô", "o").replace("ù", "u").replace("û", "u")
+    t = t.replace("ç", "c")
+    t = re.sub(r"\s+", " ", t)
+    return t
 
 
 # --------------------------------------------------------------------------------------
@@ -159,25 +163,16 @@ _WEB_SIGNAL_TERMS = (
     "insee",
     "amf",
     "acpr",
+    "internet",
+    "web",
+    "google",
+    "cherche",
+    "recherche",
+    "recherche internet",
+    "recherche web",
+    "trouve en ligne",
+    "sur internet",
 )
-
-# Confirmation Web (garder la phrase EXACTE)
-_CONFIRM_WEB_PHRASE = "aucune infos a ce suejt dans ma docuemtation je fais une recherche plus approfondie ?"
-_CONFIRM_WEB_SUFFIX = "Réponds OUI ou NON."
-
-# Session-state keys
-_SS_WEB_CONFIRM_PENDING = "web_confirm_pending"
-_SS_WEB_CONFIRM_QUESTION = "web_confirm_question"
-
-
-def _normalize_ascii(text: str) -> str:
-    t = (text or "").lower().strip()
-    t = t.replace("é", "e").replace("è", "e").replace("ê", "e")
-    t = t.replace("à", "a").replace("â", "a").replace("î", "i")
-    t = t.replace("ô", "o").replace("ù", "u").replace("û", "u")
-    t = t.replace("ç", "c")
-    t = re.sub(r"\s+", " ", t)
-    return t
 
 
 def _is_smalltalk(question: str) -> bool:
@@ -192,7 +187,6 @@ def _is_smalltalk(question: str) -> bool:
 def _has_web_signal(question: str, intent: Dict[str, Any]) -> Tuple[bool, List[str]]:
     q = _normalize_ascii(question)
     signals: List[str] = []
-
     if not q:
         return False, signals
 
@@ -236,9 +230,14 @@ def _apply_router_overrides(
     force_agent: Optional[str],
     neutral_mode: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Corrige les faiblesses de choose_sources() sans casser les autres règles.
+    - Smalltalk -> DIRECT (pas de web)
+    - INFO -> pas de web par défaut; web seulement si web_signal
+    - STRATEGIE -> pas de web par défaut; web seulement si web_signal
+    """
     debug: Dict[str, Any] = {"overrides": []}
-    sources = list(source_plan.get("sources") or [])
-    sources = [str(s) for s in sources if str(s).strip()]
+    sources = [str(s) for s in (source_plan.get("sources") or []) if str(s).strip()]
 
     if str(force_agent or "").strip():
         debug["overrides"].append("force_agent_bypass_overrides")
@@ -264,7 +263,6 @@ def _apply_router_overrides(
 
     final_sources = list(dict.fromkeys(sources))
 
-    # ✅ RÈGLE B VALIDÉE: STRATEGIE = NO WEB par défaut (sauf signaux explicites)
     if intent_type == "STRATEGIE" and not has_web_signal:
         if "web" in final_sources:
             final_sources = [s for s in final_sources if s != "web"]
@@ -289,7 +287,7 @@ def _apply_router_overrides(
 
     final_sources = list(dict.fromkeys(final_sources))
     reasoning = list(source_plan.get("reasoning") or [])
-    reasoning.extend([f"override:{x}" for x in debug.get("overrides") or []])
+    reasoning.extend([f"override:{x}" for x in (debug.get("overrides") or [])])
 
     return (
         {
@@ -302,39 +300,120 @@ def _apply_router_overrides(
 
 
 # --------------------------------------------------------------------------------------
-# Yes/No confirmation helpers
+# Darwin relevance (NEW): detect "hors sujet" even if evidence_pack not empty
 # --------------------------------------------------------------------------------------
-def _classify_yes_no(text: str) -> str:
-    """
-    Returns: "yes" | "no" | ""
-    """
-    t = _normalize_ascii(text)
-    if not t:
-        return ""
-    # Keep it strict enough to avoid accidental triggers
-    yes_tokens = ("oui", "ouais", "ok", "okay", "vas y", "vas-y", "go", "daccord", "d'accord", "parfait")
-    no_tokens = ("non", "no", "stop", "annule", "annuler", "pas maintenant")
-    if any(re.fullmatch(rf".*\b{re.escape(tok)}\b.*", t) for tok in yes_tokens):
-        return "yes"
-    if any(re.fullmatch(rf".*\b{re.escape(tok)}\b.*", t) for tok in no_tokens):
-        return "no"
-    return ""
+_STOPWORDS = {
+    "le",
+    "la",
+    "les",
+    "de",
+    "du",
+    "des",
+    "un",
+    "une",
+    "et",
+    "ou",
+    "a",
+    "au",
+    "aux",
+    "pour",
+    "par",
+    "sur",
+    "dans",
+    "avec",
+    "sans",
+    "est",
+    "sont",
+    "que",
+    "qui",
+    "quoi",
+    "quel",
+    "quelle",
+    "quels",
+    "quelles",
+    "donne",
+    "moi",
+    "tu",
+    "vous",
+    "je",
+    "j",
+    "il",
+    "elle",
+    "on",
+    "nous",
+    "vos",
+    "notre",
+    "votre",
+}
 
 
-def _make_session_state_patch_for_web_confirm(pending: bool, question: str = "") -> Dict[str, Any]:
-    if not pending:
-        return {
-            _SS_WEB_CONFIRM_PENDING: None,
-            _SS_WEB_CONFIRM_QUESTION: None,
-        }
+def _tokenize_for_relevance(text: str) -> List[str]:
+    norm = _normalize_ascii(text)
+    tokens = re.findall(r"[a-z0-9]{3,}", norm)
+    out: List[str] = []
+    for tok in tokens:
+        if tok in _STOPWORDS:
+            continue
+        if tok not in out:
+            out.append(tok)
+    return out[:24]
+
+
+def _compute_evidence_relevance(
+    question: str,
+    evidence_pack: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        "useful_count": int,
+        "raw_count": int,
+        "max_overlap": int,
+        "overlaps": [int,...]  # limited
+      }
+    """
+    items = evidence_pack.get("items") if isinstance(evidence_pack.get("items"), list) else []
+    q_tokens = _tokenize_for_relevance(question)
+    if not items or not q_tokens:
+        return {"useful_count": 0, "raw_count": len(items), "max_overlap": 0, "overlaps": []}
+
+    overlaps: List[int] = []
+    useful = 0
+    max_overlap = 0
+
+    for it in items[:12]:
+        if not isinstance(it, dict):
+            continue
+        # support multiple schemas (snippet/content/body)
+        blob = " ".join(
+            [
+                _clean(it.get("title")),
+                _clean(it.get("snippet")),
+                _clean(it.get("content")),
+                _clean(it.get("body")),
+                _clean(it.get("text")),
+            ]
+        )
+        blob_norm = _normalize_ascii(blob)
+        overlap = 0
+        for tok in q_tokens:
+            if tok and tok in blob_norm:
+                overlap += 1
+
+        overlaps.append(overlap)
+        if overlap > max_overlap:
+            max_overlap = overlap
+
+        # Heuristic: at least 2 token hits => likely relevant
+        if overlap >= 2:
+            useful += 1
+
     return {
-        _SS_WEB_CONFIRM_PENDING: True,
-        _SS_WEB_CONFIRM_QUESTION: question,
+        "useful_count": useful,
+        "raw_count": len(items),
+        "max_overlap": max_overlap,
+        "overlaps": overlaps[:10],
     }
-
-
-def _confirm_web_message() -> str:
-    return f"{_CONFIRM_WEB_PHRASE}\n\n{_CONFIRM_WEB_SUFFIX}"
 
 
 # --------------------------------------------------------------------------------------
@@ -383,8 +462,8 @@ def _retrieve_vector(question: str, history: Optional[List[dict]], k: int = 4) -
 def _retrieve_web(question: str, max_results: int = 6) -> Dict[str, Any]:
     results, provider = web_search(question, max_results=max_results)
     return {
-        "results": results,
-        "meta": {"tool": "web", "provider": provider, "rows_count": len(results)},
+        "results": results if isinstance(results, list) else [],
+        "meta": {"tool": "web", "provider": provider, "rows_count": len(results or [])},
     }
 
 
@@ -441,11 +520,7 @@ def _call_claude_local(system_prompt: str, user_prompt: str) -> Tuple[str, Dict[
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         }
-        headers = {
-            "x-api-key": str(api_key),
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
+        headers = {"x-api-key": str(api_key), "anthropic-version": "2023-06-01", "content-type": "application/json"}
 
         if httpx is not None:
             response = httpx.post(
@@ -480,12 +555,7 @@ def _call_claude_local(system_prompt: str, user_prompt: str) -> Tuple[str, Dict[
 
 def _call_claude(system_prompt: str, user_prompt: str) -> Tuple[str, Dict[str, Any]]:
     if callable(_call_claude_patched):
-        try:
-            return _call_claude_patched(system_prompt=system_prompt, user_prompt=user_prompt)
-        except Exception as exc:  # pragma: no cover
-            text, meta = _call_claude_local(system_prompt, user_prompt)
-            meta["warning"] = f"patched_failed:{exc} | {meta.get('warning') or ''}".strip()
-            return text, meta
+        return _call_claude_patched(system_prompt=system_prompt, user_prompt=user_prompt)
     return _call_claude_local(system_prompt, user_prompt)
 
 
@@ -503,98 +573,21 @@ def orchestrate_v3(
     session_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
-    _ = audit_detail, portfolio_simulation_input, scoring_version
+    _ = audit_detail, portfolio_simulation_input, scoring_version, session_state
 
     history = history or []
     question = _clean(question)
     neutral_mode = bool(neutral_pure)
-    session_state = session_state or {}
-
-    # ----------------------------------------------------------------------------------
-    # 0) Confirmation WEB (sans répéter la question)
-    # ----------------------------------------------------------------------------------
-    session_state_patch: Dict[str, Any] = {}
-    if bool(session_state.get(_SS_WEB_CONFIRM_PENDING)) and isinstance(session_state.get(_SS_WEB_CONFIRM_QUESTION), str):
-        original_question = str(session_state.get(_SS_WEB_CONFIRM_QUESTION) or "").strip()
-        decision = _classify_yes_no(question)
-        if decision == "yes":
-            # Force web on original question, clear pending
-            question = original_question
-            force_agent = force_agent or "web"
-            session_state_patch = _make_session_state_patch_for_web_confirm(False)
-        elif decision == "no":
-            # Clear pending, keep in Darwin mode
-            session_state_patch = _make_session_state_patch_for_web_confirm(False)
-            ack = "OK."
-            empty_evidence = {"items": [], "sources": [], "sources_by_layer": {}, "raw_count": 0}
-            validated = validate_output(answer=ack, question=question, intent={"type": "INFO"}, evidence_pack=empty_evidence)
-            final_answer = validated["answer"]
-            structured_v2 = build_structured_payload(
-                answer=final_answer,
-                intent={"type": "INFO"},
-                evidence_pack=empty_evidence,
-                status=str(validated.get("status") or "ok"),
-            )
-            total_time = time.time() - start_time
-            meta = {
-                "darwin_version": "v3",
-                "simple_mode": True,
-                "route_mode": "DIRECT",
-                "route_signals": {"smalltalk": False, "web_signals": [], "router_overrides": ["web_confirm_cancelled"]},
-                "intent": "INFO",
-                "intent_raw": "INFO",
-                "intent_final": "INFO",
-                "intent_cgp": structured_v2.get("intent"),
-                "kpi_target": structured_v2.get("kpi_target"),
-                "agents_called": [],
-                "agent_outputs_count": 0,
-                "selected_agent": None,
-                "selected_layer": None,
-                "neutral_pure": neutral_mode,
-                "live_web_signal": False,
-                "response_format": "structured_contract_v3",
-                "contract_format_enforced": True,
-                "contract_rewrite_engine": "direct_deterministic",
-                "finalizer_llm_provider_requested": "anthropic",
-                "finalizer_llm_provider_effective": "none_direct",
-                "finalizer_llm_model": None,
-                "llm_warning": None,
-                "anthropic_key_tail": _anthropic_key_tail(),
-                "env_boot": ENV_BOOT_META,
-                "source_plan": {"sources": [], "primary_source": None, "reasoning": ["web_confirm_cancelled"]},
-                "retrieval_meta": {},
-                "evidence_items_count": 0,
-                "evidence_raw_count": 0,
-                "followup_flow_active": False,
-                "followup_phase": "idle",
-                "effective_query_used": question,
-                "session_state_patch": session_state_patch,
-                "response_time_seconds": round(total_time, 2),
-            }
-            return {
-                "answer": final_answer,
-                "answer_text": final_answer,
-                "answer_json": {"format": "simple_v3", "intent": structured_v2.get("intent"), "answer": final_answer, "sources": []},
-                "answer_structured": {"format": "simple_v3", "intent": structured_v2.get("intent"), "answer": final_answer, "sources": []},
-                "answer_structured_v2": structured_v2,
-                "answer_contract": {"intent": str(structured_v2.get("intent") or "INFO"), "kpi_target": str(structured_v2.get("kpi_target") or "none")},
-                "details": final_answer,
-                "used_facts": [],
-                "warnings": list(validated.get("warnings") or []),
-                "sources": [],
-                "sources_by_layer": {},
-                "agent_used": "darwin_v3_brain",
-                "meta": meta,
-            }
-        # If not yes/no => continue normal flow (no clear)
 
     # 1) Intent
     intent = detect_intent(question=question, history=history)
+    intent_type = str(intent.get("type") or "INFO").upper()
 
     # 2) Sources plan (base) + router overrides
     base_plan = choose_sources(
         question=question,
         intent=intent,
+        history=history,
         force_agent=force_agent,
         neutral_pure=neutral_mode,
     )
@@ -610,20 +603,9 @@ def orchestrate_v3(
     # ✅ DIRECT = sans Claude (early return)
     if route_mode == "DIRECT":
         direct = _direct_answer(question, history)
+        empty_evidence = {"items": [], "sources": [], "sources_by_layer": {}, "raw_count": 0}
 
-        empty_evidence = {
-            "items": [],
-            "sources": [],
-            "sources_by_layer": {},
-            "raw_count": 0,
-        }
-
-        validated = validate_output(
-            answer=direct,
-            question=question,
-            intent=intent,
-            evidence_pack=empty_evidence,
-        )
+        validated = validate_output(answer=direct, question=question, intent=intent, evidence_pack=empty_evidence)
         final_answer = validated["answer"]
         warnings = list(validated.get("warnings") or [])
 
@@ -634,13 +616,7 @@ def orchestrate_v3(
             status=str(validated.get("status") or "ok"),
         )
 
-        answer_json = {
-            "format": "simple_v3",
-            "intent": structured_v2.get("intent"),
-            "answer": final_answer,
-            "sources": structured_v2.get("sources_used"),
-        }
-
+        answer_json = {"format": "simple_v3", "intent": structured_v2.get("intent"), "answer": final_answer, "sources": []}
         total_time = time.time() - start_time
 
         meta = {
@@ -675,11 +651,13 @@ def orchestrate_v3(
             "source_plan": {"sources": [], "primary_source": None, "reasoning": ["direct_early_return"]},
             "retrieval_meta": {},
             "evidence_items_count": 0,
-            "evidence_raw_count": 0,
+            "evidence_useful_count": 0,
+            "darwin_relevance_max": 0,
+            "auto_web_fallback_applied": False,
             "followup_flow_active": False,
             "followup_phase": "idle",
             "effective_query_used": question,
-            "session_state_patch": session_state_patch,
+            "session_state_patch": {},
             "response_time_seconds": round(total_time, 2),
         }
 
@@ -702,7 +680,7 @@ def orchestrate_v3(
             "meta": meta,
         }
 
-    # 3) Retrieval
+    # 3) Retrieval initial (RAG/WEB/RAG+WEB)
     raw_material: Dict[str, Dict[str, Any]] = {}
     agents_called: List[str] = []
     retrieval_meta: Dict[str, Any] = {}
@@ -721,130 +699,54 @@ def orchestrate_v3(
         retrieval_meta[source] = dict(payload.get("meta", {}) or {})
         agents_called.append(source)
 
-    # 4) Evidence + prompts
-    evidence_pack = build_evidence_pack(
-        question=question,
-        intent=intent,
-        raw_material=raw_material,
-        max_items=8,
-    )
+    # 4) Evidence pack
+    evidence_pack = build_evidence_pack(question=question, intent=intent, raw_material=raw_material, max_items=8)
 
-    # ----------------------------------------------------------------------------------
-    # 4.b) Confirmation WEB si Darwin vide (sans lancer Web tout seul)
-    # ----------------------------------------------------------------------------------
-    intent_type = str(intent.get("type") or "INFO").upper()
-    evidence_items = evidence_pack.get("items") if isinstance(evidence_pack.get("items"), list) else []
-    evidence_is_empty = len(evidence_items) == 0
+    # 4.a) NEW: Darwin relevance gate -> if RAG but not relevant => auto WEB fallback
+    # Conditions:
+    # - Only when initial route_mode == RAG
+    # - Only when not STRATEGIE (rule b)
+    # - Only when not darwin-specific
+    # - Only when user didn't force an agent
+    relevance = _compute_evidence_relevance(question=question, evidence_pack=evidence_pack)
+    evidence_useful_count = int(relevance.get("useful_count") or 0)
+    darwin_relevance_max = int(relevance.get("max_overlap") or 0)
 
-    # Gardes-fous: uniquement quand on est en RAG, pas STRATEGIE, pas déjà WEB, pas darwin-specific
+    auto_web_fallback_applied = False
     if (
         route_mode == "RAG"
-        and evidence_is_empty
         and intent_type != "STRATEGIE"
         and not bool(intent.get("is_darwin_specific"))
         and not str(force_agent or "").strip()
+        and evidence_useful_count == 0
     ):
-        confirm_text = _confirm_web_message()
-        empty_evidence = {"items": [], "sources": [], "sources_by_layer": {}, "raw_count": 0}
-        validated = validate_output(answer=confirm_text, question=question, intent=intent, evidence_pack=empty_evidence)
-        final_answer = validated["answer"]
-        warnings = list(validated.get("warnings") or [])
+        # Auto add web
+        web_payload = _retrieve_web(question)
+        raw_material["web"] = web_payload
+        retrieval_meta["web"] = dict(web_payload.get("meta", {}) or {})
+        if "web" not in agents_called:
+            agents_called.insert(0, "web")
 
-        structured_v2 = build_structured_payload(
-            answer=final_answer,
-            intent=intent,
-            evidence_pack=empty_evidence,
-            status=str(validated.get("status") or "ok"),
-        )
+        # rebuild evidence with web
+        evidence_pack = build_evidence_pack(question=question, intent=intent, raw_material=raw_material, max_items=8)
 
-        total_time = time.time() - start_time
+        # update source_plan + route_mode
+        new_sources = list(dict.fromkeys((source_plan.get("sources") or []) + ["web"]))
+        source_plan["sources"] = new_sources
+        if not source_plan.get("primary_source"):
+            source_plan["primary_source"] = "web"
+        route_mode = _route_mode_from_sources(new_sources)
 
-        # Patch session_state: on attend OUI/NON et on sauvegarde la question originale
-        session_state_patch = _make_session_state_patch_for_web_confirm(True, question)
+        # annotate overrides
+        if isinstance(router_debug, dict):
+            router_debug["overrides"] = list(dict.fromkeys((router_debug.get("overrides") or []) + ["auto_web_fallback_no_relevant_darwin"]))
+        auto_web_fallback_applied = True
 
-        meta = {
-            "darwin_version": "v3",
-            "simple_mode": True,
-            "route_mode": "RAG",
-            "route_signals": {
-                "smalltalk": False,
-                "web_signals": router_debug.get("web_signals") if isinstance(router_debug, dict) else [],
-                "router_overrides": (router_debug.get("overrides") if isinstance(router_debug, dict) else []) + ["web_confirm_requested"],
-            },
-            "intent": intent.get("type"),
-            "intent_raw": intent.get("type"),
-            "intent_final": intent.get("type"),
-            "intent_cgp": structured_v2.get("intent"),
-            "kpi_target": structured_v2.get("kpi_target"),
-            "agents_called": agents_called,
-            "agent_outputs_count": len(raw_material),
-            "selected_agent": source_plan.get("primary_source"),
-            "selected_layer": source_plan.get("primary_source"),
-            "neutral_pure": neutral_mode,
-            "live_web_signal": False,
-            "strict_realtime_required": False,
-            "strict_realtime_blocked": False,
-            "clarification_requested": True,
-            "clarification_reason": "web_confirmation_required",
-            "clarification_missing_fields": ["OUI/NON"],
-            "response_format": "structured_contract_v3",
-            "contract_format_enforced": True,
-            "contract_rewrite_engine": "direct_deterministic",
-            "finalizer_llm_provider_requested": "anthropic",
-            "finalizer_llm_provider_effective": "none_confirm",
-            "finalizer_llm_model": None,
-            "llm_warning": None,
-            "anthropic_key_tail": _anthropic_key_tail(),
-            "env_boot": ENV_BOOT_META,
-            "source_plan": source_plan,
-            "retrieval_meta": retrieval_meta,
-            "evidence_items_count": 0,
-            "evidence_raw_count": int(evidence_pack.get("raw_count") or 0),
-            "followup_flow_active": True,
-            "followup_phase": "confirm_web",
-            "effective_query_used": question,
-            "session_state_patch": session_state_patch,
-            "response_time_seconds": round(total_time, 2),
-        }
+    # 5) Prompt
+    prompts = build_prompt(question=question, history=history, intent=intent, evidence_pack=evidence_pack)
 
-        answer_json = {
-            "format": "simple_v3",
-            "intent": structured_v2.get("intent"),
-            "answer": final_answer,
-            "sources": [],
-        }
-
-        return {
-            "answer": final_answer,
-            "answer_text": final_answer,
-            "answer_json": answer_json,
-            "answer_structured": answer_json,
-            "answer_structured_v2": structured_v2,
-            "answer_contract": {
-                "intent": str(structured_v2.get("intent") or intent.get("type") or "INFO"),
-                "kpi_target": str(structured_v2.get("kpi_target") or intent.get("kpi_target") or "none"),
-            },
-            "details": final_answer,
-            "used_facts": [],
-            "warnings": warnings,
-            "sources": [],
-            "sources_by_layer": {},
-            "agent_used": "darwin_v3_brain",
-            "meta": meta,
-        }
-
-    prompts = build_prompt(
-        question=question,
-        history=history,
-        intent=intent,
-        evidence_pack=evidence_pack,
-    )
-
-    # 5) Claude synthesis (or fallback)
-    answer_raw, llm_meta = _call_claude(
-        system_prompt=prompts.get("system_prompt", ""),
-        user_prompt=prompts.get("user_prompt", ""),
-    )
+    # 6) Claude synthesis (or deterministic fallback)
+    answer_raw, llm_meta = _call_claude(system_prompt=prompts.get("system_prompt", ""), user_prompt=prompts.get("user_prompt", ""))
 
     deterministic_payload: Optional[Dict[str, Any]] = None
     if not _clean(answer_raw) and callable(synthesize_answer):
@@ -859,13 +761,8 @@ def orchestrate_v3(
             llm_meta = dict(llm_meta or {})
             llm_meta["warning"] = f"{llm_meta.get('warning') or ''} | deterministic_failed:{exc}".strip()
 
-    # 6) Validate + structured payload
-    validated = validate_output(
-        answer=answer_raw,
-        question=question,
-        intent=intent,
-        evidence_pack=evidence_pack,
-    )
+    # 7) Validate + structured payload
+    validated = validate_output(answer=answer_raw, question=question, intent=intent, evidence_pack=evidence_pack)
     final_answer = validated["answer"]
     warnings = list(validated.get("warnings") or [])
 
@@ -922,11 +819,13 @@ def orchestrate_v3(
         "source_plan": source_plan,
         "retrieval_meta": retrieval_meta,
         "evidence_items_count": len(evidence_pack.get("items") or []),
-        "evidence_raw_count": int(evidence_pack.get("raw_count") or 0),
+        "evidence_useful_count": evidence_useful_count,
+        "darwin_relevance_max": darwin_relevance_max,
+        "auto_web_fallback_applied": auto_web_fallback_applied,
         "followup_flow_active": False,
         "followup_phase": "idle",
         "effective_query_used": question,
-        "session_state_patch": session_state_patch,
+        "session_state_patch": {},
         "response_time_seconds": round(total_time, 2),
     }
 
@@ -955,25 +854,21 @@ def orchestrate_v3(
 
 
 if __name__ == "__main__":
+    # Smoke tests (run as module):
+    #   python -m backend.core.orchestrator_v3
     tests = [
-        "donne le pga de la scpi wemo",
-        "oui",
-        "non",
+        "hello",
+        "Quelle est la capitale du Japon ?",
+        "taux BCE actuel 2026 ?",
+        "Client prudent, 80k€, veut immobilier papier mais craint la liquidité. Recommandation + plan d’action.",
+        "Quels sont les frais de Darwin RE01 ?",
     ]
-    ss = {}
     for q in tests:
-        res = orchestrate_v3(question=q, history=[], session_state=ss)
-        ss_patch = (res.get("meta") or {}).get("session_state_patch") or {}
-        # emulate api.py merge behavior
-        if isinstance(ss_patch, dict):
-            for k, v in ss_patch.items():
-                if v is None:
-                    ss.pop(k, None)
-                else:
-                    ss[k] = v
+        res = orchestrate_v3(question=q, history=[])
         print("\n====================")
         print("Q:", q)
         print("route_mode:", res.get("meta", {}).get("route_mode"))
-        print("followup_phase:", res.get("meta", {}).get("followup_phase"))
-        print("session_state:", ss)
-        print("answer:", (res.get("answer") or "")[:220])
+        print("agents_called:", res.get("meta", {}).get("agents_called"))
+        print("useful_count:", res.get("meta", {}).get("evidence_useful_count"), "max_overlap:", res.get("meta", {}).get("darwin_relevance_max"))
+        print("auto_web_fallback_applied:", res.get("meta", {}).get("auto_web_fallback_applied"))
+        print("answer:", (res.get("answer") or "")[:200])
