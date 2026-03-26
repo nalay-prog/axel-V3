@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./AppLegacy.css";
 
 const STORAGE_KEY = "darwin_conversations_v1";
-const API_URL = process.env.REACT_APP_API_URL || "https://web-production-6adf6.up.railway.app/ask";
+const API_URL = process.env.REACT_APP_API_URL || "http://localhost:5050/ask";
 const DEFAULT_TITLE = "Nouvelle conversation";
 
 const nowIso = () => new Date().toISOString();

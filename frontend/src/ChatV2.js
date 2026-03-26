@@ -3,7 +3,7 @@ import "./ChatV2.css";
 
 const STORAGE_KEY = "darwin_conversations_v1";
 const AUDIT_DETAIL_STORAGE_KEY = "darwin_audit_detail_v1";
-const API_URL = process.env.REACT_APP_API_URL || "https://web-production-6adf6.up.railway.app/ask";
+const API_URL = process.env.REACT_APP_API_URL || "http://localhost:5050/ask";
 const DEFAULT_TITLE = "Nouvelle conversation";
 const ASSISTANT_NAME = "Axel";
 const ASSISTANT_AVATAR_URL =
@@ -215,6 +215,109 @@ function RenderMessage({ content, isReportMessage }) {
   return renderMessageContent(toText(content), isReportMessage);
 }
 
+/* ============================================================================
+   ✅ AJOUT INTELLIGENT: barre de chargement + pourcentage (sans backend streaming)
+   - monte vite puis ralentit
+   - plafonne à 92% jusqu'à la réponse
+   - passe à 100% quand la réponse arrive
+============================================================================ */
+function useSmartProgress() {
+  const [active, setActive] = useState(false);
+  const [percent, setPercent] = useState(0);
+  const intervalRef = useRef(null);
+
+  const start = () => {
+    if (intervalRef.current) window.clearInterval(intervalRef.current);
+    setActive(true);
+    setPercent(0);
+
+    const startedAt = Date.now();
+    intervalRef.current = window.setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+
+      let next;
+      if (elapsed < 2500) {
+        next = (elapsed / 2500) * 65;
+      } else if (elapsed < 9000) {
+        next = 65 + ((elapsed - 2500) / 6500) * 25;
+      } else {
+        next = 92;
+      }
+
+      // petit bruit visuel (+0..1) pour éviter sensation “bloquée”
+      next = Math.min(92, Math.max(0, next + Math.random() * 1));
+
+      setPercent((prev) => (next > prev ? next : prev));
+    }, 120);
+  };
+
+  const finish = async () => {
+    if (intervalRef.current) window.clearInterval(intervalRef.current);
+    setPercent(100);
+    await new Promise((r) => setTimeout(r, 220));
+    setActive(false);
+    setPercent(0);
+  };
+
+  const stop = () => {
+    if (intervalRef.current) window.clearInterval(intervalRef.current);
+    setActive(false);
+    setPercent(0);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (intervalRef.current) window.clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  return { active, percent: Math.round(percent), start, finish, stop };
+}
+
+function LoadingBar({ active, percent }) {
+  if (!active) return null;
+
+  return (
+    <div
+      style={{
+        position: "sticky",
+        top: 0,
+        zIndex: 30,
+        background: "rgba(255,255,255,0.85)",
+        backdropFilter: "blur(6px)",
+        padding: "10px 0 6px",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div
+          style={{
+            flex: 1,
+            height: 8,
+            background: "rgba(0,0,0,0.08)",
+            borderRadius: 999,
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              width: `${percent}%`,
+              height: "100%",
+              transition: "width 120ms linear",
+              background: "rgba(0,0,0,0.65)",
+            }}
+          />
+        </div>
+        <div style={{ width: 46, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+          {percent}%
+        </div>
+      </div>
+      <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
+        Recherche & synthèse en cours…
+      </div>
+    </div>
+  );
+}
+
 function ChatV2() {
   const [conversations, setConversations] = useState(() => safeParseConversations());
   const [activeConversationId, setActiveConversationId] = useState(() => {
@@ -231,6 +334,9 @@ function ChatV2() {
   const [auditDetail, setAuditDetail] = useState(() =>
     safeParseBoolean(AUDIT_DETAIL_STORAGE_KEY, false)
   );
+
+  // ✅ AJOUT: progress UI
+  const progress = useSmartProgress();
 
   const messagesViewportRef = useRef(null);
   const textareaRef = useRef(null);
@@ -436,6 +542,10 @@ function ChatV2() {
     forceStickToBottomRef.current = true;
     appendMessage(targetConversation.id, userMessage, shortText(content));
     setLoading(true);
+
+    // ✅ AJOUT: démarre la barre de progression au moment du fetch
+    progress.start();
+
     setQuestion("");
 
     try {
@@ -479,6 +589,8 @@ function ChatV2() {
       });
     } finally {
       setLoading(false);
+      // ✅ AJOUT: termine la progression quoi qu'il arrive
+      await progress.finish();
     }
   };
 
@@ -682,6 +794,9 @@ function ChatV2() {
               ) : (
                 <div className="v2-messages-shell">
                   <div className="v2-messages" ref={messagesViewportRef} onScroll={handleMessagesScroll}>
+                    {/* ✅ AJOUT: barre de chargement */}
+                    <LoadingBar active={progress.active} percent={progress.percent} />
+
                     {activeConversation.messages.map((msg) => {
                       const isReportMessage =
                         msg.role === "assistant" && isReportLikeMessage(msg.content);
@@ -713,7 +828,6 @@ function ChatV2() {
                         <div className="v2-typing">Analyse en cours...</div>
                       </article>
                     )}
-
                   </div>
 
                   {showJumpToBottom && (

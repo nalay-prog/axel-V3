@@ -1,7 +1,7 @@
 {
   "build": {
     "builder": "NIXPACKS",
-    "buildCommand": "cd frontend && npm install && npm run build"
+    "buildCommand": "npm install --prefix frontend && npm run build --prefix frontend"
   },
   "deploy": {
     "startCommand": "python -m flask --app backend.routes.api run --host 0.0.0.0 --port $PORT"
